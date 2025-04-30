@@ -1,3 +1,3 @@
-system: "{'reasoning': True}"
+system: "{{'reasoning': True}}" # double curly braces to interpret this as string literal
 
 user: "{problem}"
