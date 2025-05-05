@@ -21,6 +21,16 @@ class CodeMetrics(BaseMetrics):
     def __init__(self):
         self.reset()
 
+    def update_comb_metric(self, perf_dict, current_correct_base, current_correct_plus):
+        """Helper to update counts for non-averaged metrics."""
+        perf_dict["total_correct"] += int(current_correct_base)
+        perf_dict["total_correct_plus"] += int(current_correct_plus)
+
+    def update_comb_metric_averaged(self, perf_dict, current_correct_base_avg, current_correct_plus_avg):
+        """Helper to update counts for averaged metrics."""
+        perf_dict["total_correct"] += current_correct_base_avg
+        perf_dict["total_correct_plus"] += current_correct_plus_avg
+
     def update(self, predictions):
         """Updating the evaluation results with the current element.
 
@@ -30,30 +40,52 @@ class CodeMetrics(BaseMetrics):
         """
         self.total += 1
 
-        if len(predictions) > 1:
-            self.agg_mode = f"pass@{len(predictions)}"
+        k = len(predictions)
 
-            self.total_correct += any([elem['is_correct'] for elem in predictions])
-            self.total_correct_plus += any([elem['is_correct-plus'] for elem in predictions])
+        if k == 1:
+            # Single decoding
+            current_correct_base = predictions[0]['is_correct']
+            current_correct_plus = predictions[0]['is_correct-plus']
+            self.update_comb_metric(
+                self.agg_mode_dict["greedy"], current_correct_base, current_correct_plus
+            )
         else:
-            # If single prediction, set it to greedy aggregation mode
-            self.agg_mode = "greedy"
+            # Multiple decodings - iterate through k values
+            for current_k in range(k, 0, -1):
+                current_predictions = predictions[:current_k]
 
-            self.total_correct += predictions[0]['is_correct']
-            self.total_correct_plus += predictions[0]['is_correct-plus']
+                # Pass@K
+                pass_k_correct = any([elem['is_correct'] for elem in current_predictions])
+                pass_k_correct_plus = any([elem['is_correct-plus'] for elem in current_predictions])
+                self.update_comb_metric(
+                    self.agg_mode_dict[f"pass@{current_k}"], pass_k_correct, pass_k_correct_plus
+                )
+
+                # Pass@1[K] - mean of pass@1 across the top k generations
+                pass_1_k_correct_avg = sum([elem['is_correct'] for elem in current_predictions]) / current_k
+                pass_1_k_correct_plus_avg = sum([elem['is_correct-plus'] for elem in current_predictions]) / current_k
+                self.update_comb_metric_averaged(
+                    self.agg_mode_dict[f"pass@1[{current_k}]"], pass_1_k_correct_avg, pass_1_k_correct_plus_avg
+                )
 
     def get_metrics(self):
-        metrics_dict = {
-            "num_entries": self.total,
-            "passing_base_tests": self.total_correct / self.total * 100.0,
-            "passing_plus_tests": self.total_correct_plus / self.total * 100.0,
-        }
+        metrics_dict = {}
+        for agg_mode, agg_metric_dict in self.agg_mode_dict.items():
+            metrics_dict[agg_mode] = {
+                "num_entries": self.total,
+                "passing_base_tests": agg_metric_dict["total_correct"] / self.total * 100.0,
+                "passing_plus_tests": agg_metric_dict["total_correct_plus"] / self.total * 100.0,
+            }
 
-        return {self.agg_mode: metrics_dict}
+        return metrics_dict
 
     def reset(self):
         self.total = 0
-        self.total_correct = 0
-        self.total_correct_plus = 0
-        # Aggregation mode is automatically set
-        self.agg_mode = "greedy"
+        # Store metrics per aggregation mode
+        self.agg_mode_dict = defaultdict(lambda: defaultdict(float))
+
+    def max_aggregations_to_print(self):
+        """Limit printing to only the metrics for the highest k."""
+        # Corresponds to pass@k and pass@1[k] for the highest k
+        # plus the greedy result if available (implicitly handled by summary script)
+        return 2
