@@ -1,0 +1,3 @@
+system: "{{'reasoning': False}}" # double curly braces to interpret this as string literal
+
+user: "{problem}"
