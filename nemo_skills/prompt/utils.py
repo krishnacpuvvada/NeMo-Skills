@@ -107,11 +107,13 @@ class PromptConfig:
     system: str = ""
     template: PromptTemplate = None
     few_shot_examples: FewShotExamplesConfig = field(default_factory=FewShotExamplesConfig)
+    assistant_prefix: str = ""
 
 
 class Prompt:
     SYSTEM_FORMAT = "{text_begin}{system_begin}{system}{system_end}"
-    TURN_BEGIN_FORMAT = "{user_begin}{user}{user_end}{assistant_begin}"
+    # TURN_BEGIN_FORMAT = "{user_begin}{user}{user_end}{assistant_begin}"
+    TURN_BEGIN_FORMAT = "{user_begin}{user}{user_end}{assistant_begin}{assistant_prefix}"
     TURN_END_FORMAT = "{assistant}{assistant_end}"
 
     def __init__(self, config):
@@ -247,7 +249,8 @@ class Prompt:
                     system=self.config.system.format(**input_dict), **asdict(self.config.template)
                 )
                 prompt_string += self.TURN_BEGIN_FORMAT.format(
-                    user=self.build_user_message(input_dict), **asdict(self.config.template)
+                    # user=self.build_user_message(input_dict), **asdict(self.config.template)
+                    user=self.build_user_message(input_dict), assistant_prefix=input_dict['assistant_prefix'], **asdict(self.config.template)
                 )
                 if generation:
                     # Generation can be part of the input in cases such as reward models

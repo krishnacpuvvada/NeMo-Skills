@@ -12,10 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import ast
 import json
 import logging
 import shutil
 import subprocess
+import re
 from argparse import Namespace
 from copy import deepcopy
 from dataclasses import asdict, field
@@ -42,6 +44,173 @@ def eval_mcq(cfg):
             for sample in tqdm(data):
                 sample['predicted_answer'] = extract_answer(sample["generation"])
                 sample['is_correct'] = sample['predicted_answer'] == sample['expected_answer']
+                fout.write(json.dumps(sample) + "\n")
+
+
+@nested_dataclass(kw_only=True)
+class RulerEvaluatorConfig:
+    parse_func: str = "default"
+    match_type: str
+
+def eval_ruler(cfg):
+
+    def default_parse(prediction):
+        prediction = prediction.strip()
+         # Remove all non-printable characters
+        np_pattern = re.compile(r'[\x00-\x1f]')
+        pp_predict = np_pattern.sub('\n', prediction).strip()
+        return pp_predict
+
+    def string_match_all_single(preds, refs):
+        # """the metric function with input (predictions: [str], references: [[str]]) to compute score."""
+        preds = [preds]
+        refs = [refs]
+        score = [sum([1.0 if r.lower() in pred.lower() else 0.0 for r in ref]) / len(ref) for pred, ref in zip(preds, refs)][0]
+        return score
+
+    def string_match_part_single(preds, refs):
+        preds = [preds]
+        refs = [refs]
+        score = [sum([max([1.0 if r.lower() in pred.lower() else 0.0 for r in ref]) for pred, ref in zip(preds, refs)])][0]
+        return score
+
+    eval_config = RulerEvaluatorConfig(**cfg.eval_config)
+    assert eval_config.parse_func in ['default',], f"Unsupported eval type: {eval_config.parse_func}"
+    assert eval_config.match_type in ['all', 'part'], f"Unsupported eval match type: {eval_config.match_type}"
+
+    parse_funcs = {
+        'default': default_parse,
+    }
+    match_type_funcs = {
+        'all': string_match_all_single,
+        'part': string_match_part_single,
+    }
+
+    for file in unroll_files(cfg.input_files):
+        with open(file, 'rt', encoding='utf-8') as fin:
+            data = [json.loads(line) for line in fin]
+        with open(file, 'wt', encoding='utf-8') as fout:
+            for sample in tqdm(data):
+                parse_result = parse_funcs[eval_config.parse_func](sample['generation'])
+                sample['is_correct'] = match_type_funcs[eval_config.match_type](sample['generation'], sample['expected_answer'])
+                sample['predicted_answer'] = parse_result
+                fout.write(json.dumps(sample) + "\n")
+
+
+@nested_dataclass(kw_only=True)
+class LoftEvaluatorConfig:
+    parse_func: str = "default"
+    metrics: str = "recall_at_k"
+    k: int = 1
+
+def eval_loft(cfg):
+
+    def extract_prediction(model_output: str):
+        """Extracts the prediction from the model output."""
+
+        def _escape_single_quotes(s: str):
+            # Converts patterns like "['child bride', 'the devil's sleep']" to
+            # "['child bride', 'the devil\'s sleep']" to allow for proper parsing.
+
+            pattern = r"([a-zA-Z0-9])'([a-zA-Z0-9])"
+            replacement = r"\1\'\2"
+
+            return re.sub(pattern, replacement, s)
+
+        # Remove formatting.
+        model_output = model_output.replace("*", "").replace("`", "")
+        model_output = model_output.strip().split("\n")
+        # Extract the predictions from the model output
+        preds = []
+        for l in model_output:
+            # Turns the string "Final Answer: [1, ...]" into the list of ints [1, ...]
+            if "final answer" in l.lower() and "[" in l and "]" in l:
+                pred_start_index = l.find("[")
+                pred_end_index = l.rfind("]") + 1  # Finds the last "]"
+                pred_as_str = l[pred_start_index:pred_end_index].strip()
+                try:
+                    pred_as_str = _escape_single_quotes(pred_as_str)
+                    preds = ast.literal_eval(pred_as_str)
+                    preds = [str(i) for i in preds]
+                except Exception as e:  # pylint: disable=broad-exception-caught
+                    print(l, e)
+                break
+        return preds
+
+
+    def compute_recall_at_k(gold_ids: list[str], pred_ids: list[str], top_k: int, capped: bool = False) -> float:
+        """
+        Calculates the recall at k.
+        Borrow from https://github.com/google-deepmind/loft/blob/eb2c7106dc11f9782dfe6c5af2e81400d2831d64/evaluation/retrieval.py#L26
+        """
+        assert top_k > 0
+        if not pred_ids:
+            return 0
+        pred_ids = set(pred_ids[:top_k])
+        relevant_in_top_k = float(len(pred_ids.intersection(gold_ids)))
+
+        # Capped recall@k is triggered when # of gold docs is > top_k
+        if capped and len(gold_ids) > top_k:
+            recall = relevant_in_top_k / top_k
+        else:
+            recall = relevant_in_top_k / len(gold_ids)
+        return recall
+
+
+    def compute_mrecall_at_k(gold_ids: list[str], pred_ids: list[str], top_k: int) -> float:
+
+        """Calculates the mRecall at k.
+
+        This metric was introduced in Min et al., 2021:
+        https://aclanthology.org/2021.emnlp-main.560.pdf
+
+        Args:
+            gold_ids: A list of gold IDs.
+            pred_ids: A list of prediction IDs.
+            top_k: The number of predictions to consider.
+
+        Returns:
+            mRecall@k metric.
+        """
+        assert top_k > 0
+        if not pred_ids:
+            return 0
+        pred_ids = set(pred_ids[:top_k])
+        relevant_in_top_k = float(len(pred_ids.intersection(gold_ids)))
+
+        # This computes the completeness of the answers.
+        return float(relevant_in_top_k == min(top_k, len(gold_ids)))
+
+
+    eval_config = LoftEvaluatorConfig(**cfg.eval_config)
+
+    assert eval_config.parse_func in ['default',], f"Unsupported parse_func: {eval_config.parse_func}"
+    assert eval_config.metrics in ['recall_at_k', 'mrecall_at_k'], f"Unsupported metric: {eval_config.parse_func}"
+
+    parse_funcs = {
+        'default': extract_prediction,
+    }
+    metrics_funcs = {
+        'recall_at_k': compute_recall_at_k,
+        'mrecall_at_k': compute_mrecall_at_k,
+    }
+
+    for file in unroll_files(cfg.input_files):
+        with open(file, 'rt', encoding='utf-8') as fin:
+            data = [json.loads(line) for line in fin]
+        with open(file, 'wt', encoding='utf-8') as fout:
+            for sample in tqdm(data):
+                parse_result = parse_funcs[eval_config.parse_func](sample['generation'])
+
+                # just single turn for now
+                gold_ids = [i[0] for i in sample['expected_answer']]
+                if eval_config.metrics == 'recall_at_k':
+                    metric_name = f'recall_at_{eval_config.k}'
+                elif eval_config.metrics == 'mrecall_at_k':
+                    metric_name = f'mrecall_at_{eval_config.k}'
+
+                sample[metric_name] = metrics_funcs[eval_config.metrics](gold_ids, parse_result, top_k=eval_config.k)
+                sample['predicted_answer'] = parse_result
                 fout.write(json.dumps(sample) + "\n")
 
 
@@ -432,6 +601,8 @@ EVALUATOR_MAP = {
     'lean4-proof': eval_lean4_proof,
     'lean4-statement': eval_lean4_statement,
     'multichoice': eval_mcq,
+    'ruler': eval_ruler,
+    'loft': eval_loft,
 }
 
 
